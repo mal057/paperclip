@@ -578,7 +578,13 @@ export function agentRoutes(
     if (req.actor.type !== "agent" || req.actor.agentId !== agent.id) {
       return { kind: "standard" as const };
     }
-    const run = req.actor.type === "agent" && req.actor.runId
+    // Guard the run lookup with a UUID check: `heartbeatRuns.id` is a uuid
+    // column, so a non-uuid run_id claim makes Postgres throw
+    // (`invalid input syntax for type uuid`) and 500s the whole request. A
+    // run_id that isn't a valid uuid can never match a real run anyway, so
+    // treat it the same as "run not found" (null) and fall back to the
+    // standard trust preset.
+    const run = req.actor.type === "agent" && req.actor.runId && isUuidLike(req.actor.runId)
       ? await db
           .select({
             companyId: heartbeatRuns.companyId,
