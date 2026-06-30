@@ -162,13 +162,15 @@ describe("adapter routes", () => {
       requiresMaterializedRuntimeSkills: false,
     });
 
-    // process adapter should have no local capabilities
+    // process adapter has no skills/instructions-bundle capabilities, but it
+    // DOES support the local-agent JWT so first-party agents spawned through it
+    // can authenticate back to the Paperclip API (handoff_issue, comments).
     const processAdapter = res.body.find((a: any) => a.type === "process");
     expect(processAdapter).toBeDefined();
     expect(processAdapter.capabilities).toMatchObject({
       supportsInstructionsBundle: false,
       supportsSkills: false,
-      supportsLocalAgentJwt: false,
+      supportsLocalAgentJwt: true,
       requiresMaterializedRuntimeSkills: false,
     });
 

@@ -12,16 +12,26 @@ import {
 } from "../utils.js";
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
-  const { runId, agent, config, onLog, onMeta } = ctx;
+  const { runId, agent, config, onLog, onMeta, authToken } = ctx;
   const command = asString(config.command, "");
   if (!command) throw new Error("Process adapter missing command");
 
   const args = asStringArray(config.args);
   const cwd = asString(config.cwd, process.cwd());
   const envConfig = parseObject(config.env);
+  const hasExplicitApiKey =
+    typeof envConfig.PAPERCLIP_API_KEY === "string" &&
+    envConfig.PAPERCLIP_API_KEY.trim().length > 0;
   const env: Record<string, string> = { ...buildPaperclipEnv(agent) };
+  env.PAPERCLIP_RUN_ID = runId;
   for (const [k, v] of Object.entries(envConfig)) {
     if (typeof v === "string") env[k] = v;
+  }
+  // Inject the per-run, company-scoped agent JWT so the spawned process can
+  // authenticate back to the Paperclip API. An explicit PAPERCLIP_API_KEY in
+  // config.env always wins. Mirrors the canonical *-local adapters.
+  if (!hasExplicitApiKey && authToken) {
+    env.PAPERCLIP_API_KEY = authToken;
   }
   const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
   const resolvedCommand = await resolveCommandForLogs(command, cwd, runtimeEnv);
