@@ -534,6 +534,56 @@ describe.sequential("issue comment reopen routes", () => {
     ));
   });
 
+  it("does NOT implicitly reopen closed issues via comments when PAPERCLIP_DISABLE_IMPLICIT_COMMENT_REOPEN=1", async () => {
+    vi.stubEnv("PAPERCLIP_DISABLE_IMPLICIT_COMMENT_REOPEN", "1");
+    try {
+      mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue("done"),
+        ...patch,
+      }));
+
+      const res = await request(await installActor(createApp()))
+        .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+        .send({ body: "hello" });
+
+      expect(res.status).toBe(201);
+      expect(mockIssueService.update).not.toHaveBeenCalledWith(
+        "11111111-1111-4111-8111-111111111111",
+        { status: "todo" },
+      );
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ reason: "issue_reopened_via_comment" }),
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("still honors explicit reopen=true when PAPERCLIP_DISABLE_IMPLICIT_COMMENT_REOPEN=1", async () => {
+    vi.stubEnv("PAPERCLIP_DISABLE_IMPLICIT_COMMENT_REOPEN", "1");
+    try {
+      mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue("done"),
+        ...patch,
+      }));
+
+      const res = await request(await installActor(createApp()))
+        .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+        .send({ comment: "hello", reopen: true });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        "11111111-1111-4111-8111-111111111111",
+        expect.objectContaining({ status: "todo" }),
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("rejects non-assignee agent POST comments on closed issues", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
     mockIssueService.addComment.mockResolvedValue({
