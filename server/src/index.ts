@@ -802,6 +802,10 @@ export async function startServer(): Promise<StartedServer> {
 
       const promotion = await heartbeat.promoteDueScheduledRetries();
       await heartbeat.resumeQueuedRuns();
+      // Pump-sole-driver isolation: startup reconciliation mutates issue
+      // state outside the pump (re-flipped the narrator ledger on restart,
+      // 2026-07-02). Same gate as the periodic chain below.
+      if (process.env.PAPERCLIP_DISABLE_ASSIGNMENT_WAKE === "1") return;
       const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
       if (
         promotion.promoted > 0 ||
