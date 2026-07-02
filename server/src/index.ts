@@ -843,6 +843,7 @@ export async function startServer(): Promise<StartedServer> {
         logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
       }
 
+      if (process.env.PAPERCLIP_DISABLE_ASSIGNMENT_WAKE === "1") return;
       const reviewed = await heartbeat.reconcileProductivityReviews();
       if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
         logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
@@ -889,6 +890,11 @@ export async function startServer(): Promise<StartedServer> {
         .then(() => heartbeat.promoteDueScheduledRetries())
         .then(async (promotion) => {
           await heartbeat.resumeQueuedRuns();
+          // Pump-sole-driver isolation: the periodic reconcilers below mutate
+          // issue state and spawn runs/review work outside the external pump
+          // (observed 2026-07-02: recovery escalated the narrator ledger and
+          // productivity review re-woke agents). Reapers/sweepers stay active.
+          if (process.env.PAPERCLIP_DISABLE_ASSIGNMENT_WAKE === "1") return;
           const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
           if (
             promotion.promoted > 0 ||
@@ -905,18 +911,21 @@ export async function startServer(): Promise<StartedServer> {
           }
         })
         .then(async () => {
+          if (process.env.PAPERCLIP_DISABLE_ASSIGNMENT_WAKE === "1") return;
           const reconciled = await heartbeat.reconcileIssueGraphLiveness();
           if (reconciled.escalationsCreated > 0) {
             logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation created escalations");
           }
         })
         .then(async () => {
+          if (process.env.PAPERCLIP_DISABLE_ASSIGNMENT_WAKE === "1") return;
           const reconciled = await heartbeat.reconcileTaskWatchdogs();
           if (reconciled.triggered > 0) {
             logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation triggered watchdog work");
           }
         })
         .then(async () => {
+          if (process.env.PAPERCLIP_DISABLE_ASSIGNMENT_WAKE === "1") return;
           const scanned = await heartbeat.scanSilentActiveRuns();
           if (scanned.created > 0 || scanned.escalated > 0) {
             logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
@@ -929,6 +938,7 @@ export async function startServer(): Promise<StartedServer> {
           }
         })
         .then(async () => {
+          if (process.env.PAPERCLIP_DISABLE_ASSIGNMENT_WAKE === "1") return;
           const reviewed = await heartbeat.reconcileProductivityReviews();
           if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
             logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
