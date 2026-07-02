@@ -30,6 +30,24 @@ export function queueIssueAssignmentWakeup(input: {
 }) {
   if (!input.issue.assigneeAgentId || input.issue.status === "backlog") return;
 
+  // Pump-sole-driver isolation (single local GPU). When the external serial
+  // pump is the ONLY thing allowed to start agent runs, Paperclip must NOT
+  // auto-wake an assignee on assignment/creation: that bypasses the pump and
+  // spawns concurrent orchestrators (the 2026-06-28 churn cascade — Zane
+  // delegates a child ticket -> assignee auto-woken -> 2nd orchestrator).
+  // Default behavior is unchanged; fully reversible by unsetting the env.
+  if (process.env.PAPERCLIP_DISABLE_ASSIGNMENT_WAKE === "1") {
+    logger.info(
+      {
+        issueId: input.issue.id,
+        assigneeAgentId: input.issue.assigneeAgentId,
+        mutation: input.mutation,
+      },
+      "assignment wake suppressed (PAPERCLIP_DISABLE_ASSIGNMENT_WAKE=1; pump is sole driver)",
+    );
+    return;
+  }
+
   return input.heartbeat
     .wakeup(input.issue.assigneeAgentId, {
       source: "assignment",

@@ -2782,6 +2782,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       if (issue.status === "todo") {
+        // Pump-sole-driver isolation (single local GPU). When the external
+        // serial pump is the ONLY thing allowed to start agent runs, the
+        // recovery loop must NOT auto-dispatch assigned `todo` issues: that
+        // bypasses the pump and spawns concurrent orchestrators (the periodic
+        // `assigned_todo_liveness_dispatch` that kept reviving delegated work
+        // on 2026-06-28). The pump picks these up one at a time (lane 3c).
+        // Same flag as assignment-wake; default behavior unchanged, reversible.
+        if (process.env.PAPERCLIP_DISABLE_ASSIGNMENT_WAKE === "1") {
+          result.skipped += 1;
+          continue;
+        }
         if (!latestRun) {
           if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
             result.skipped += 1;

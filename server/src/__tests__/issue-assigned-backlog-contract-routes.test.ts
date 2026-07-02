@@ -167,6 +167,7 @@ function expectClearAssignedStatusValidation(res: request.Response) {
 describe("assigned backlog creation contract", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockWakeup.mockResolvedValue({ id: "run-1", status: "queued" });
     mockIssueService.getById.mockResolvedValue(makeIssue({
       id: "parent-1",
       title: "Parent issue",
@@ -221,6 +222,11 @@ describe("assigned backlog creation contract", () => {
     expect(res.body).toEqual(expect.objectContaining({
       assigneeAgentId,
       status: "todo",
+      assignmentWake: {
+        status: "queued",
+        runId: "run-1",
+        runStatus: "queued",
+      },
     }));
     expect(mockWakeup).toHaveBeenCalledWith(
       assigneeAgentId,
@@ -334,5 +340,30 @@ describe("assigned backlog creation contract", () => {
       }),
     );
     expect(mockWakeup).not.toHaveBeenCalled();
+    expect(res.body.assignmentWake).toEqual({
+      status: "skipped",
+      reason: "assigned_backlog",
+    });
+  });
+
+  it("keeps successful issue creation but surfaces assignment wake failure", async () => {
+    mockWakeup.mockRejectedValueOnce(new Error("Agent is not invokable: paused"));
+
+    const res = await request(await createApp())
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Assigned while paused",
+        assigneeAgentId,
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body).toMatchObject({
+      id: "issue-1",
+      assigneeAgentId,
+      assignmentWake: {
+        status: "failed",
+        error: "Agent is not invokable: paused",
+      },
+    });
   });
 });

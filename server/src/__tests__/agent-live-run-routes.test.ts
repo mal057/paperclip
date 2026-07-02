@@ -4,6 +4,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
+  pause: vi.fn(),
+  resume: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -14,6 +16,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRunLogAccess: vi.fn(),
   readLog: vi.fn(),
   wakeup: vi.fn(),
+  cancelActiveForAgent: vi.fn(),
 }));
 
 const mockIssueService = vi.hoisted(() => ({
@@ -83,7 +86,16 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp(db: Record<string, unknown> = {}) {
+async function createApp(
+  db: Record<string, unknown> = {},
+  actor: Record<string, unknown> = {
+    type: "board",
+    userId: "local-board",
+    companyIds: ["company-1"],
+    source: "local_implicit",
+    isInstanceAdmin: false,
+  },
+) {
   const [{ agentRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -91,13 +103,7 @@ async function createApp(db: Record<string, unknown> = {}) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
+    (req as any).actor = actor;
     next();
   });
   app.use("/api", agentRoutes(db as any));
@@ -236,6 +242,19 @@ describe("agent live run routes", () => {
       invocationSource: "on_demand",
       triggerDetail: "manual",
     });
+    mockAgentService.pause.mockImplementation(async (id: string) => ({
+      id,
+      companyId: "company-1",
+      name: "Builder",
+      status: "paused",
+    }));
+    mockAgentService.resume.mockImplementation(async (id: string) => ({
+      id,
+      companyId: "company-1",
+      name: "Builder",
+      status: "idle",
+    }));
+    mockHeartbeatService.cancelActiveForAgent.mockResolvedValue(undefined);
   });
 
   it("returns a compact active run payload for issue polling", async () => {
@@ -636,5 +655,97 @@ describe("agent live run routes", () => {
         actorId: "local-board",
       },
     });
+  });
+
+  it("allows only Zane to pause, resume, and wake one other agent", async () => {
+    const zaneActor = {
+      type: "agent",
+      agentId: "6fa7b823-647c-4b52-b8ae-268f078f3d46",
+      companyId: "company-1",
+      companyIds: ["company-1"],
+      source: "agent_jwt",
+      runId: "run-zane",
+    };
+    mockAgentService.getById.mockResolvedValue({
+      id: routeAgentId,
+      companyId: "company-1",
+      name: "Builder",
+      status: "idle",
+      orgChainHealth: { status: "healthy" },
+    });
+
+    const app = await createApp({}, zaneActor);
+    const pause = await requestApp(
+      app,
+      (baseUrl) => request(baseUrl).post(`/api/agents/${routeAgentId}/pause`).send({}),
+    );
+    const resume = await requestApp(
+      app,
+      (baseUrl) => request(baseUrl).post(`/api/agents/${routeAgentId}/resume`).send({}),
+    );
+    const wake = await requestApp(
+      app,
+      (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${routeAgentId}/wakeup`)
+        .send({ source: "on_demand", reason: "Zane delegated one task" }),
+    );
+
+    expect(pause.status, JSON.stringify(pause.body)).toBe(200);
+    expect(pause.body.status).toBe("paused");
+    expect(resume.status, JSON.stringify(resume.body)).toBe(200);
+    expect(resume.body.status).toBe("idle");
+    expect(wake.status, JSON.stringify(wake.body)).toBe(202);
+    expect(wake.body).toMatchObject({ id: "run-1", status: "queued" });
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.cancelActiveForAgent).toHaveBeenCalledWith(routeAgentId);
+  });
+
+  it("denies raw orchestration operations to any non-Zane agent", async () => {
+    const workerActor = {
+      type: "agent",
+      agentId: "99999999-9999-4999-8999-999999999999",
+      companyId: "company-1",
+      companyIds: ["company-1"],
+      source: "agent_jwt",
+      runId: "run-worker",
+    };
+    mockAgentService.getById.mockResolvedValue({
+      id: routeAgentId,
+      companyId: "company-1",
+      name: "Builder",
+      status: "idle",
+      orgChainHealth: { status: "healthy" },
+    });
+
+    for (const operation of ["pause", "resume", "wakeup"]) {
+      const response = await requestApp(
+        await createApp({}, workerActor),
+        (baseUrl) => request(baseUrl)
+          .post(`/api/agents/${routeAgentId}/${operation}`)
+          .send(operation === "wakeup" ? { source: "on_demand" } : {}),
+      );
+      expect(response.status, `${operation}: ${JSON.stringify(response.body)}`).toBe(403);
+    }
+    expect(mockAgentService.pause).not.toHaveBeenCalled();
+    expect(mockAgentService.resume).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("returns not found for a missing orchestration target", async () => {
+    mockAgentService.getById.mockResolvedValue(null);
+    const response = await requestApp(
+      await createApp({}, {
+        type: "agent",
+        agentId: "6fa7b823-647c-4b52-b8ae-268f078f3d46",
+        companyId: "company-1",
+        companyIds: ["company-1"],
+        source: "agent_jwt",
+        runId: "run-zane",
+      }),
+      (baseUrl) => request(baseUrl).post(`/api/agents/${routeAgentId}/wakeup`).send({
+        source: "on_demand",
+      }),
+    );
+    expect(response.status).toBe(404);
   });
 });

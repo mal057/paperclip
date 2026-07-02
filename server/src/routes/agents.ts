@@ -103,6 +103,7 @@ import { recoveryService } from "../services/recovery/service.js";
 import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
 import { readObject } from "../lib/objects.js";
 import { listInvalidOrgChainDescendantIds } from "../services/agent-invokability.js";
+import { isTeamOrchestratorAgentId } from "../services/team-orchestrator.js";
 
 const RUN_LOG_DEFAULT_LIMIT_BYTES = 256_000;
 const RUN_LOG_MAX_LIMIT_BYTES = 1024 * 1024;
@@ -681,6 +682,19 @@ export function agentRoutes(
     });
     if (decision.allowed) return;
     throw forbidden(decision.explanation);
+  }
+
+  async function assertCanOrchestrateAgentLifecycle(
+    req: Request,
+    target: { companyId: string },
+  ) {
+    assertCompanyAccess(req, target.companyId);
+    if (req.actor.type === "board") {
+      await assertBoardCanManageAgentsForCompany(req, target.companyId);
+      return;
+    }
+    if (isTeamOrchestratorAgentId(req.actor.agentId)) return;
+    throw forbidden("Only the configured team orchestrator can manage another agent's lifecycle");
   }
 
   async function assertCanReadConfigurations(req: Request, companyId: string) {
@@ -2946,11 +2960,13 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/pause", async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
-    if (!(await getAccessibleAgent(req, res, id))) {
+    const existing = await svc.getById(id);
+    if (!existing) {
+      res.status(404).json({ error: "Agent not found" });
       return;
     }
+    await assertCanOrchestrateAgentLifecycle(req, existing);
     const agent = await svc.pause(id);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
@@ -2959,10 +2975,13 @@ export function agentRoutes(
 
     await heartbeat.cancelActiveForAgent(id);
 
+    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
       action: "agent.paused",
       entityType: "agent",
       entityId: agent.id,
@@ -2972,12 +2991,13 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/resume", async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
-    const existing = await getAccessibleAgent(req, res, id);
+    const existing = await svc.getById(id);
     if (!existing) {
+      res.status(404).json({ error: "Agent not found" });
       return;
     }
+    await assertCanOrchestrateAgentLifecycle(req, existing);
     if (existing.orgChainHealth?.status === "invalid_org_chain") {
       res.status(409).json({
         error: existing.orgChainHealth?.repairGuidance ?? "Repair this agent's reporting chain before resuming it",
@@ -2990,10 +3010,13 @@ export function agentRoutes(
       return;
     }
 
+    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
       action: "agent.resumed",
       entityType: "agent",
       entityId: agent.id,
@@ -3277,7 +3300,7 @@ export function agentRoutes(
     assertCompanyAccess(req, agent.companyId);
 
     if (req.actor.type === "agent") {
-      if (req.actor.agentId !== id) {
+      if (req.actor.agentId !== id && !isTeamOrchestratorAgentId(req.actor.agentId)) {
         res.status(403).json({ error: "Agent can only invoke itself" });
         return;
       }
@@ -3351,7 +3374,7 @@ export function agentRoutes(
     assertCompanyAccess(req, agent.companyId);
 
     if (req.actor.type === "agent") {
-      if (req.actor.agentId !== id) {
+      if (req.actor.agentId !== id && !isTeamOrchestratorAgentId(req.actor.agentId)) {
         res.status(403).json({ error: "Agent can only invoke itself" });
         return;
       }
@@ -3371,6 +3394,7 @@ export function agentRoutes(
       idempotencyKey: unknown;
       forceFreshSession: unknown;
       triggerDetail: unknown;
+      issueId: unknown;
     }>;
     const contextSnapshot: Record<string, unknown> = {
       triggeredBy: req.actor.type,
@@ -3378,6 +3402,25 @@ export function agentRoutes(
     };
     if (body.forceFreshSession === true) {
       contextSnapshot.forceFreshSession = true;
+    }
+    // Bind the run to the issue the caller (the pump) is waking the agent for, so
+    // the orchestrator reads contextSnapshot.issueId instead of guessing from the
+    // inbox (which grabbed stale in-progress work). Accepts a top-level issueId or
+    // payload.issueId. This is projected as the run's issueId (contextSnapshot ->> 'issueId').
+    {
+      const payloadIssueId =
+        body.payload && typeof body.payload === "object" && !Array.isArray(body.payload)
+          ? (body.payload as Record<string, unknown>).issueId
+          : undefined;
+      const scopedIssueId =
+        typeof body.issueId === "string" && body.issueId.trim()
+          ? body.issueId.trim()
+          : typeof payloadIssueId === "string" && payloadIssueId.trim()
+            ? payloadIssueId.trim()
+            : "";
+      if (scopedIssueId) {
+        contextSnapshot.issueId = scopedIssueId;
+      }
     }
     const wakeOpts: Parameters<typeof heartbeat.wakeup>[1] = {
       source: "on_demand",

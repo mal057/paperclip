@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -152,6 +152,14 @@ import {
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
+import { evaluateAgentInvokabilityFromDb } from "../services/agent-invokability.js";
+import {
+  coordinateIssueHandoff,
+  handoffIssueSchema,
+  validateIssueHandoffPolicy,
+  type PriorIssueHandoff,
+} from "../services/issue-handoff.js";
+import { isTeamOrchestratorAgentId } from "../services/team-orchestrator.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -850,6 +858,13 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   checkoutRunId: string | null | undefined;
   executionRunId: string | null | undefined;
 }) {
+  // Comments must never silently reactivate finished work. Local-CLI agents
+  // and the board actor authenticate as "user", so the actorType guard below
+  // cannot tell a human from an agent — 63 closed issues were flipped back to
+  // todo this way (2026-06-30 overnight churn). Reopening now requires an
+  // explicit signal (reopen/resume flag or a status PATCH), which stays fully
+  // functional. Unset the env to restore implicit reopen-on-comment.
+  if (process.env.PAPERCLIP_DISABLE_IMPLICIT_COMMENT_REOPEN === "1") return false;
   // Local-CLI agents post comments under user auth, so the actor.type is "user"
   // even though the comment originates from the same heartbeat run that owns
   // the issue lock. Without this guard, an agent that closes its own issue and
@@ -5262,22 +5277,278 @@ export function issueRoutes(
       });
     }
 
-    void queueIssueAssignmentWakeup({
-      heartbeat,
-      issue,
-      reason: "issue_assigned",
-      mutation: "create",
-      contextSource: "issue.create",
-      requestedByActorType: actor.actorType,
-      requestedByActorId: actor.actorId,
-    });
+    let assignmentWake:
+      | { status: "skipped"; reason: "no_agent_assignee" | "assigned_backlog" }
+      | { status: "queued"; runId: string | null; runStatus: string | null }
+      | { status: "failed"; error: string };
+    if (!issue.assigneeAgentId || issue.status === "backlog") {
+      assignmentWake = {
+        status: "skipped",
+        reason: issue.assigneeAgentId ? "assigned_backlog" : "no_agent_assignee",
+      };
+    } else {
+      try {
+        const wakeResult = await queueIssueAssignmentWakeup({
+          heartbeat,
+          issue,
+          reason: "issue_assigned",
+          mutation: "create",
+          contextSource: "issue.create",
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          rethrowOnError: true,
+        }) as { id?: unknown; status?: unknown } | null | undefined;
+        assignmentWake = wakeResult
+          ? {
+              status: "queued",
+              runId: typeof wakeResult.id === "string" ? wakeResult.id : null,
+              runStatus: typeof wakeResult.status === "string" ? wakeResult.status : null,
+            }
+          : {
+              status: "failed",
+              error: "Assignment wake request was skipped",
+            };
+      } catch (error) {
+        assignmentWake = {
+          status: "failed",
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
     await queueTaskWatchdogEvaluation(issue, actor.runId);
 
     res.status(201).json({
       ...issue,
+      assignmentWake,
       relatedWork: referenceSummary,
       referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
     });
+  });
+
+  router.post("/issues/:id/handoff", validate(handoffIssueSchema), async (req, res) => {
+    if (req.actor.type !== "agent" || !req.actor.agentId) {
+      throw forbidden("Issue handoff requires agent authentication");
+    }
+    const issueId = req.params.id as string;
+    const actor = getActorInfo(req);
+    const actorAgentId = req.actor.agentId;
+    const { targetAgentId, reason, evidence, idempotencyKey } = req.body;
+
+    const result = await coordinateIssueHandoff({
+      commit: () => db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${issueId}))`);
+
+        const issue = await tx
+          .select({
+            id: issueRows.id,
+            companyId: issueRows.companyId,
+            identifier: issueRows.identifier,
+            status: issueRows.status,
+            assigneeAgentId: issueRows.assigneeAgentId,
+            parentId: issueRows.parentId,
+          })
+          .from(issueRows)
+          .where(eq(issueRows.id, issueId))
+          .then((rows) => rows[0] ?? null);
+
+        let parentAssigneeAgentId: string | null = null;
+        if (issue?.parentId) {
+          parentAssigneeAgentId = await tx
+            .select({ assigneeAgentId: issueRows.assigneeAgentId })
+            .from(issueRows)
+            .where(eq(issueRows.id, issue.parentId))
+            .then((rows) => rows[0]?.assigneeAgentId ?? null);
+        }
+
+        const loadAgent = (agentId: string) => tx
+          .select({
+            id: agents.id,
+            companyId: agents.companyId,
+            name: agents.name,
+            status: agents.status,
+            reportsTo: agents.reportsTo,
+          })
+          .from(agents)
+          .where(eq(agents.id, agentId))
+          .then((rows) => rows[0] ?? null);
+        const [sourceAgent, targetAgent] = await Promise.all([
+          loadAgent(actorAgentId),
+          loadAgent(targetAgentId),
+        ]);
+
+        const recentHandoffRows = issue
+          ? await tx
+              .select({ details: activityLog.details })
+              .from(activityLog)
+              .where(and(
+                eq(activityLog.companyId, issue.companyId),
+                eq(activityLog.entityType, "issue"),
+                eq(activityLog.entityId, issue.id),
+                eq(activityLog.action, "issue.handoff_committed"),
+              ))
+              .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+              .limit(20)
+          : [];
+        const handoffDetails = recentHandoffRows
+          .map((row) => row.details)
+          .filter((details): details is Record<string, unknown> =>
+            Boolean(details) && typeof details === "object");
+        const duplicateIdempotencyKey = handoffDetails.some(
+          (details) => details.idempotencyKey === idempotencyKey,
+        );
+        const last = handoffDetails[0];
+        const priorHandoff: PriorIssueHandoff | null =
+          last
+          && typeof last.fromAgentId === "string"
+          && typeof last.toAgentId === "string"
+          && typeof last.idempotencyKey === "string"
+            ? {
+                fromAgentId: last.fromAgentId,
+                toAgentId: last.toAgentId,
+                idempotencyKey: last.idempotencyKey,
+              }
+            : null;
+
+        validateIssueHandoffPolicy({
+          issue: issue
+            ? { ...issue, parentAssigneeAgentId }
+            : null,
+          actor: sourceAgent,
+          target: targetAgent,
+          priorHandoff,
+          duplicateIdempotencyKey,
+        });
+
+        const invokability = await evaluateAgentInvokabilityFromDb(
+          tx as unknown as Db,
+          targetAgent,
+        );
+        if (!invokability.invokable) {
+          throw conflict(
+            isTeamOrchestratorAgentId(targetAgentId)
+              ? "Zane is not invokable; a board operator must restore the orchestrator before handoff"
+              : "Target agent is not invokable; handoff was not committed",
+            {
+              targetAgentId,
+              targetStatus: targetAgent?.status ?? null,
+              ...invokability,
+            },
+          );
+        }
+
+        const txIssues = issueService(tx as unknown as Db);
+        const comment = await txIssues.addComment(
+          issueId,
+          [
+            `## Handoff to ${targetAgent!.name}`,
+            "",
+            `**Reason:** ${reason}`,
+            "",
+            "**Evidence / summary:**",
+            evidence,
+          ].join("\n"),
+          { agentId: actorAgentId, runId: actor.runId },
+          undefined,
+          tx,
+        );
+        const nextStatus = isTeamOrchestratorAgentId(targetAgentId)
+          ? "in_review"
+          : "todo";
+        const updated = await txIssues.update(
+          issueId,
+          {
+            assigneeAgentId: targetAgentId,
+            assigneeUserId: null,
+            status: nextStatus,
+            actorAgentId,
+          },
+          tx,
+        );
+        if (!updated) throw notFound("Issue not found");
+
+        await tx.insert(activityLog).values({
+          companyId: issue!.companyId,
+          actorType: "agent",
+          actorId: actorAgentId,
+          agentId: actorAgentId,
+          runId: actor.runId,
+          action: "issue.handoff_committed",
+          entityType: "issue",
+          entityId: issueId,
+          details: {
+            fromAgentId: actorAgentId,
+            toAgentId: targetAgentId,
+            idempotencyKey,
+            reason,
+            evidenceCommentId: comment.id,
+          },
+        });
+
+        return {
+          issueId,
+          companyId: issue!.companyId,
+          issueIdentifier: issue!.identifier,
+          fromAgentId: actorAgentId,
+          toAgentId: targetAgentId,
+          targetName: targetAgent!.name,
+          status: updated.status,
+          commentId: comment.id,
+          idempotencyKey,
+        };
+      }),
+      wake: (handoff) => {
+        // Pump-sole-driver isolation (single local GPU): a handoff must not
+        // spawn a concurrent orchestrator for the target agent. The committed
+        // re-assignment is enough — the serial pump wakes the new assignee on
+        // its next tick. Same switch as issue-assignment-wakeup.ts.
+        if (process.env.PAPERCLIP_DISABLE_ASSIGNMENT_WAKE === "1") {
+          logger.info(
+            { issueId: handoff.issueId, toAgentId: handoff.toAgentId },
+            "handoff wake suppressed (PAPERCLIP_DISABLE_ASSIGNMENT_WAKE=1; pump is sole driver)",
+          );
+          return Promise.resolve({ id: `pump-deferred:${handoff.issueId}`, status: "deferred" });
+        }
+        return heartbeat.wakeup(handoff.toAgentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_handoff",
+        payload: {
+          issueId: handoff.issueId,
+          mutation: "handoff",
+          handoffCommentId: handoff.commentId,
+        },
+        idempotencyKey: `handoff:${handoff.idempotencyKey}`,
+        requestedByActorType: "agent",
+        requestedByActorId: handoff.fromAgentId,
+        contextSnapshot: {
+          issueId: handoff.issueId,
+          taskId: handoff.issueId,
+          source: "issue.handoff",
+          handoffCommentId: handoff.commentId,
+        },
+        });
+      },
+      recordWakeFailure: async (handoff, error) => {
+        await logActivity(db, {
+          companyId: handoff.companyId,
+          actorType: "agent",
+          actorId: actorAgentId,
+          agentId: actorAgentId,
+          runId: actor.runId,
+          action: "issue.handoff_wakeup_failed",
+          entityType: "issue",
+          entityId: handoff.issueId,
+          details: {
+            fromAgentId: handoff.fromAgentId,
+            toAgentId: handoff.toAgentId,
+            idempotencyKey: handoff.idempotencyKey,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        });
+      },
+    });
+
+    res.status(200).json(result);
   });
 
   router.post("/issues/:id/children", applyCreateIssueStatusDefault, validate(createChildIssueSchema), async (req, res) => {
