@@ -1191,6 +1191,12 @@ export function issueRoutes(
   const environmentsSvc = environmentService(db);
 
   async function queueTaskWatchdogEvaluation(issue: { id: string; companyId: string }, runId?: string | null) {
+    // Pump-sole-driver isolation: watchdog reconciliation spawns review
+    // tickets (e.g. "Review productivity for X") whose lifecycle re-wakes
+    // agents outside the pump — one such chain re-woke a frozen worker on
+    // 2026-07-02. Under sole-driver mode the pump's own cooldown/attempt caps
+    // are the churn control, so skip watchdog evaluation entirely.
+    if (process.env.PAPERCLIP_DISABLE_ASSIGNMENT_WAKE === "1") return;
     await taskWatchdogsSvc
       .reconcileForIssueAndAncestors(issue.companyId, issue.id, { runId: runId ?? null })
       .catch((err) => {
@@ -6983,6 +6989,16 @@ export function issueRoutes(
       }
 
       for (const { agentId, wakeup } of wakeups.values()) {
+        // Pump-sole-driver isolation: board mutations must not start agent
+        // runs directly — the serial pump reads the board and wakes agents
+        // itself (with cooldown/attempt caps). Same switch as
+        // issue-assignment-wakeup.ts; observed bypass 2026-07-02
+        // (issue_children_completed re-woke a frozen worker).
+        if (process.env.PAPERCLIP_DISABLE_ASSIGNMENT_WAKE === "1") {
+          logger.info({ issueId: issue.id, agentId, reason: wakeup.reason },
+            "issue-update wake suppressed (PAPERCLIP_DISABLE_ASSIGNMENT_WAKE=1; pump is sole driver)");
+          continue;
+        }
         heartbeat
           .wakeup(agentId, wakeup)
           .catch((err) => logger.warn({ err, issueId: issue.id, agentId }, "failed to wake agent on issue update"));
@@ -8382,6 +8398,12 @@ export function issueRoutes(
       }
 
       for (const { agentId, wakeup } of wakeups.values()) {
+        // Pump-sole-driver isolation — see the issue-update dispatch loop.
+        if (process.env.PAPERCLIP_DISABLE_ASSIGNMENT_WAKE === "1") {
+          logger.info({ issueId: currentIssue.id, agentId, reason: wakeup.reason },
+            "issue-comment wake suppressed (PAPERCLIP_DISABLE_ASSIGNMENT_WAKE=1; pump is sole driver)");
+          continue;
+        }
         heartbeat
           .wakeup(agentId, wakeup)
           .catch((err) => logger.warn({ err, issueId: currentIssue.id, agentId }, "failed to wake agent on issue comment"));

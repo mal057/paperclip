@@ -6552,6 +6552,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const now = opts?.now ?? new Date();
     const retryReason = opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
     const wakeReason = opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
+    // Pump-sole-driver isolation (single local GPU): scheduled retries start
+    // agent runs OUTSIDE the external serial pump — observed 2026-07-02: a
+    // retry fired minutes after the pump was disabled, re-waking a worker on
+    // work the operator had frozen. Under sole-driver mode the pump re-wakes
+    // actionable issues itself (with its own cooldown/attempt caps), so the
+    // server must not queue its own retries. Default behavior unchanged.
+    if (process.env.PAPERCLIP_DISABLE_ASSIGNMENT_WAKE === "1") {
+      logger.info(
+        { runId: run.id, agentId: run.agentId, retryReason },
+        "scheduled retry suppressed (PAPERCLIP_DISABLE_ASSIGNMENT_WAKE=1; pump is sole driver)",
+      );
+      return {
+        outcome: "retry_exhausted" as const,
+        attempt: (run.scheduledRetryAttempt ?? 0) + 1,
+        maxAttempts: 0,
+      };
+    }
     const maxAttempts = Math.max(0, Math.floor(opts?.maxAttempts ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS));
     const nextAttempt = (run.scheduledRetryAttempt ?? 0) + 1;
     const baseSchedule = opts?.delayMs != null
