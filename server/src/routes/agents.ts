@@ -103,7 +103,7 @@ import { recoveryService } from "../services/recovery/service.js";
 import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
 import { readObject } from "../lib/objects.js";
 import { listInvalidOrgChainDescendantIds } from "../services/agent-invokability.js";
-import { isTeamOrchestratorAgentId } from "../services/team-orchestrator.js";
+import { canAgentWakeAgent, isTeamOrchestratorAgentId } from "../services/team-orchestrator.js";
 
 const RUN_LOG_DEFAULT_LIMIT_BYTES = 256_000;
 const RUN_LOG_MAX_LIMIT_BYTES = 1024 * 1024;
@@ -3300,7 +3300,7 @@ export function agentRoutes(
     assertCompanyAccess(req, agent.companyId);
 
     if (req.actor.type === "agent") {
-      if (req.actor.agentId !== id && !isTeamOrchestratorAgentId(req.actor.agentId)) {
+      if (!(await canAgentWakeAgent(db, req.actor.agentId, agent))) {
         res.status(403).json({ error: "Agent can only invoke itself" });
         return;
       }
@@ -3374,7 +3374,7 @@ export function agentRoutes(
     assertCompanyAccess(req, agent.companyId);
 
     if (req.actor.type === "agent") {
-      if (req.actor.agentId !== id && !isTeamOrchestratorAgentId(req.actor.agentId)) {
+      if (!(await canAgentWakeAgent(db, req.actor.agentId, agent))) {
         res.status(403).json({ error: "Agent can only invoke itself" });
         return;
       }

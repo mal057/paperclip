@@ -748,4 +748,138 @@ describe("agent live run routes", () => {
     );
     expect(response.status).toBe(404);
   });
+
+  describe("manager-chain wake authority", () => {
+    const REV_CO = "company-rev";
+    const ORCHESTRATOR_ID = "59d44a4a-4b81-4440-8bdb-d29d93b744a4";
+    const orchestratorActor = {
+      type: "agent",
+      agentId: ORCHESTRATOR_ID,
+      companyId: REV_CO,
+      companyIds: [REV_CO],
+      source: "agent_jwt",
+      runId: "run-orch",
+    };
+    const specialist = (reportsTo: string | null) => ({
+      id: routeAgentId,
+      companyId: REV_CO,
+      name: "Intelligence",
+      status: "idle",
+      reportsTo,
+      orgChainHealth: { status: "healthy" },
+    });
+    const chainDb = (rows: Array<{ id: string; reportsTo: string | null }>) => ({
+      select: vi.fn(() => ({
+        from: vi.fn(() => ({
+          where: vi.fn(async () => rows),
+        })),
+      })),
+    });
+    const wakeBody = { source: "on_demand", payload: { issueId: "issue-1" } };
+
+    it("allows a manager to wake a direct report via /wakeup and /heartbeat/invoke", async () => {
+      mockAgentService.getById.mockResolvedValue(specialist(ORCHESTRATOR_ID));
+      const db = chainDb([]);
+      const app = await createApp(db, orchestratorActor);
+
+      const wake = await requestApp(
+        app,
+        (baseUrl) => request(baseUrl).post(`/api/agents/${routeAgentId}/wakeup`).send(wakeBody),
+      );
+      expect(wake.status, JSON.stringify(wake.body)).toBe(202);
+      expect(wake.body).toMatchObject({ id: "run-1", status: "queued" });
+
+      const invoke = await requestApp(
+        app,
+        (baseUrl) => request(baseUrl)
+          .post(`/api/agents/${routeAgentId}/heartbeat/invoke`)
+          .send({ source: "on_demand", issueId: "issue-1" }),
+      );
+      expect(invoke.status, JSON.stringify(invoke.body)).toBe(202);
+
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(2);
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        routeAgentId,
+        expect.objectContaining({
+          requestedByActorType: "agent",
+          requestedByActorId: ORCHESTRATOR_ID,
+        }),
+      );
+      // Direct reports resolve without touching the database.
+      expect(db.select).not.toHaveBeenCalled();
+    });
+
+    it("allows a transitive manager (grand-manager) to wake a report", async () => {
+      mockAgentService.getById.mockResolvedValue(specialist("mid"));
+      const db = chainDb([
+        { id: "mid", reportsTo: ORCHESTRATOR_ID },
+        { id: ORCHESTRATOR_ID, reportsTo: null },
+        { id: routeAgentId, reportsTo: "mid" },
+      ]);
+      const response = await requestApp(
+        await createApp(db, orchestratorActor),
+        (baseUrl) => request(baseUrl).post(`/api/agents/${routeAgentId}/wakeup`).send(wakeBody),
+      );
+      expect(response.status, JSON.stringify(response.body)).toBe(202);
+      expect(db.select).toHaveBeenCalledTimes(1);
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    });
+
+    it("denies an unrelated same-company agent", async () => {
+      mockAgentService.getById.mockResolvedValue(specialist(ORCHESTRATOR_ID));
+      const response = await requestApp(
+        await createApp(chainDb([
+          { id: ORCHESTRATOR_ID, reportsTo: null },
+          { id: routeAgentId, reportsTo: ORCHESTRATOR_ID },
+          { id: "99999999-9999-4999-8999-999999999999", reportsTo: ORCHESTRATOR_ID },
+        ]), {
+          ...orchestratorActor,
+          agentId: "99999999-9999-4999-8999-999999999999",
+          runId: "run-peer",
+        }),
+        (baseUrl) => request(baseUrl).post(`/api/agents/${routeAgentId}/wakeup`).send(wakeBody),
+      );
+      expect(response.status, JSON.stringify(response.body)).toBe(403);
+      expect(response.body.error).toBe("Agent can only invoke itself");
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("denies a manager from another company before the chain check", async () => {
+      mockAgentService.getById.mockResolvedValue(specialist(ORCHESTRATOR_ID));
+      const db = chainDb([]);
+      const response = await requestApp(
+        await createApp(db, { ...orchestratorActor, companyId: "company-1", companyIds: ["company-1"] }),
+        (baseUrl) => request(baseUrl).post(`/api/agents/${routeAgentId}/wakeup`).send(wakeBody),
+      );
+      expect(response.status, JSON.stringify(response.body)).toBe(403);
+      expect(response.body.error).toBe("Agent key cannot access another company");
+      expect(db.select).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("still allows an agent to wake itself", async () => {
+      mockAgentService.getById.mockResolvedValue(specialist(null));
+      const response = await requestApp(
+        await createApp({}, { ...orchestratorActor, agentId: routeAgentId, runId: "run-self" }),
+        (baseUrl) => request(baseUrl).post(`/api/agents/${routeAgentId}/wakeup`).send(wakeBody),
+      );
+      expect(response.status, JSON.stringify(response.body)).toBe(202);
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    });
+
+    it("denies when the reporting chain never reaches the caller (depth guard)", async () => {
+      mockAgentService.getById.mockResolvedValue(specialist("n1"));
+      // A 12-deep chain that terminates at a root other than the caller.
+      const rows: Array<{ id: string; reportsTo: string | null }> = [];
+      for (let i = 1; i <= 12; i += 1) rows.push({ id: `n${i}`, reportsTo: i < 12 ? `n${i + 1}` : null });
+      rows.push({ id: routeAgentId, reportsTo: "n1" });
+      rows.push({ id: ORCHESTRATOR_ID, reportsTo: null });
+      const response = await requestApp(
+        await createApp(chainDb(rows), orchestratorActor),
+        (baseUrl) => request(baseUrl).post(`/api/agents/${routeAgentId}/wakeup`).send(wakeBody),
+      );
+      expect(response.status, JSON.stringify(response.body)).toBe(403);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+  });
 });
