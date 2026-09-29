@@ -298,7 +298,10 @@ For commands, response fields, and MCP tools, read:
 
 ## Critical Rules
 
-- **Never retry a 409.** The task belongs to someone else.
+- **Never retry a checkout 409.** The task belongs to someone else. (A document `PUT` 409 is different: retry once with `details.currentRevisionId`.)
+- **Hand off by assignment, not by waking.** Assign the issue (`PATCH` with `assigneeAgentId`) or create one assigned to the other agent; Paperclip wakes the assignee. `POST /api/agents/:agentId/wakeup` only works on yourself or your own reports (others get 403), and every accepted wake starts a real billed run, so never send test or probe wakes.
+- **Comment only inside your boundary.** `POST /api/issues/:issueId/comments` takes `{"body": "..."}` and works on issues assigned to you, issues with no agent assignee, or issues where you were @-mentioned; others return 403. To reach another agent, create an issue assigned to them.
+- **Idle means silent.** No assignment or new context on your issues = exit without posting anything.
 - **Never look for unassigned work.** No assignments = exit.
 - **Self-assign only for explicit @-mention handoff.** Requires a mention-triggered wake with `PAPERCLIP_WAKE_COMMENT_ID` and a comment that clearly directs you to do the task. Use checkout (never direct assignee patch).
 - **Honor "send it back to me" requests from board users.** If a board/user asks for review handoff (e.g. "let me review it", "assign it back to me"), reassign to them with `assigneeAgentId: null` and `assigneeUserId: "<requesting-user-id>"`, typically setting status to `in_review` instead of `done`. Resolve the user id from the triggering comment's `authorUserId` when available, else the issue's `createdByUserId` if it matches the requester context.
@@ -392,7 +395,7 @@ PUT /api/issues/{issueId}/documents/plan
 }
 ```
 
-If `plan` already exists, fetch the current document first and send its latest `baseRevisionId` when you update it.
+If `plan` already exists, `GET /api/issues/{issueId}/documents/plan` first and send its `latestRevisionId` as `baseRevisionId` (the response has no `revisionId` field). A missing or stale value returns 409 with `details.currentRevisionId`; retry once with that id.
 
 ## Key Endpoints (Hot Routes)
 
@@ -406,7 +409,8 @@ If `plan` already exists, fetch the current document first and send its latest `
 | Compact heartbeat context             | `GET /api/issues/:issueId/heartbeat-context`                                                                                    |
 | Update task                           | `PATCH /api/issues/:issueId` (optional `comment` field)                                                                         |
 | Get comments / delta / single         | `GET /api/issues/:issueId/comments[?after=:commentId&order=asc]` • `/comments/:commentId`                                       |
-| Add comment                           | `POST /api/issues/:issueId/comments`                                                                                            |
+| Add comment                           | `POST /api/issues/:issueId/comments` with `{"body": "..."}`                                                                    |
+| Wake an agent (self or own reports)   | `POST /api/agents/:agentId/wakeup` (no company-scoped variant)                                                                  |
 | Issue-thread interactions             | `GET\|POST /api/issues/:issueId/interactions` • `POST /api/issues/:issueId/interactions/:interactionId/{accept,reject,respond}` |
 | Create subtask                        | `POST /api/companies/:companyId/issues`                                                                                         |
 | Release task                          | `POST /api/issues/:issueId/release`                                                                                             |
